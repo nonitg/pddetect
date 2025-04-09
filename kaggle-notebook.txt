@@ -1,0 +1,429 @@
+# Parkinson's Disease Detection from Voice
+# Complete Pipeline: Preprocessing + Training
+
+# This notebook contains two key parts:
+# 1. Preprocessing audio data into spectrograms (Part 1)
+# 2. Training a CNN model on the spectrograms (Part 2)
+
+# First, let's save our preprocessing module
+%%writefile preprocessing.py
+import os
+import numpy as np
+import pandas as pd
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import cv2
+from tqdm import tqdm
+import random
+import torch
+import torchaudio
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import audiomentations
+
+# Constants - MODIFIED FOR BETTER SPECTROGRAMS
+SAMPLE_RATE = 16000  # 16 kHz
+DURATION = 3  # seconds
+TARGET_LENGTH = SAMPLE_RATE * DURATION  # 48000 samples
+FFT_WINDOW = 1024  # Reduced from 2048 for better time resolution
+HOP_LENGTH = 160    # Reduced from 512 to increase time steps (more meaningful data)
+N_MELS = 128
+IMG_SIZE = 224  # for CNN input
+
+# Set random seeds for reproducibility
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+def load_and_preprocess_audio(file_path, target_sr=SAMPLE_RATE):
+    """
+    Load, trim silence, normalize, and focus only on the active parts of the audio
+    """
+    try:
+        y, sr = librosa.load(file_path, sr=target_sr)
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
+
+    # More aggressive silence trimming
+    y, _ = librosa.effects.trim(y, top_db=35)  # Higher top_db = more trimming
+    
+    # Apply energy-based trimming to focus on active regions
+    frame_length = 1024
+    hop_length = 512
+    
+    # Calculate energy envelope
+    energy = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    
+    # Find frames with significant energy (above 3% of max)
+    threshold = 0.03 * np.max(energy)
+    active_frames = np.where(energy > threshold)[0]
+    
+    if len(active_frames) > 0:
+        # Convert frames to samples
+        start_sample = max(0, active_frames[0] * hop_length - frame_length)
+        end_sample = min(len(y), (active_frames[-1] + 1) * hop_length + frame_length)
+        
+        # Trim to active region
+        y = y[start_sample:end_sample]
+    
+    # Normalize audio
+    y = librosa.util.normalize(y)
+
+    return y
+
+def create_mel_spectrogram(audio, sr=SAMPLE_RATE, n_fft=FFT_WINDOW, 
+                           hop_length=HOP_LENGTH, n_mels=N_MELS):
+    """
+    Convert audio to a mel spectrogram with better time resolution
+    """
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio, 
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels
+    )
+
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+    
+    # Crop any trailing silence in the spectrogram
+    # Calculate column-wise energy
+    eps = 1e-10
+    spec_energy = np.sum(np.power(10, mel_spec_db/10), axis=0) + eps
+    
+    # Find the last column with significant energy
+    threshold = 0.01 * np.max(spec_energy)  # 1% of max energy
+    active_cols = np.where(spec_energy > threshold)[0]
+    
+    if len(active_cols) > 0:
+        # Keep only the active part plus a small padding
+        padding = 5
+        end_col = min(active_cols[-1] + padding, mel_spec_db.shape[1] - 1)
+        mel_spec_db = mel_spec_db[:, :end_col+1]
+    
+    return mel_spec_db
+
+def resize_for_cnn(spec, target_size=(224, 224)):
+    """
+    Process spectrogram for CNN input: make square, normalize, and apply colormap
+    """
+    # First, make the spectrogram square by resizing to n_mels x n_mels
+    n_mels = spec.shape[0]
+    
+    # If the spectrogram width is already close to square, keep it
+    # Otherwise, make it square first then resize to target
+    if abs(spec.shape[1] - n_mels) / n_mels > 0.2:  # If width differs from height by more than 20%
+        # Make the initial shape square
+        square_spec = cv2.resize(spec, (n_mels, n_mels), interpolation=cv2.INTER_LINEAR)
+    else:
+        # Already close to square
+        square_spec = spec
+    
+    # Normalize to 0-1 range
+    spec_min = np.min(square_spec)
+    spec_max = np.max(square_spec)
+    spec_normalized = (square_spec - spec_min) / (spec_max - spec_min + 1e-10)
+    
+    # Convert to uint8 (0-255)
+    spec_img = (spec_normalized * 255).astype(np.uint8)
+    
+    # Resize to target CNN input size
+    if target_size != (n_mels, n_mels):
+        spec_img_resized = cv2.resize(spec_img, (target_size[1], target_size[0]), interpolation=cv2.INTER_LINEAR)
+    else:
+        spec_img_resized = spec_img
+    
+    # Apply color map for better feature visualization
+    # JET colormap is good for spectrograms as it highlights frequency patterns
+    spec_img_color = cv2.applyColorMap(spec_img_resized, cv2.COLORMAP_JET)
+    
+    # Convert from BGR to RGB (OpenCV uses BGR by default)
+    spec_img_color = cv2.cvtColor(spec_img_color, cv2.COLOR_BGR2RGB)
+
+    return spec_img_color
+
+# Audio augmentation pipeline
+def get_audio_augmenter():
+    """
+    Create audio augmentation pipeline
+    """
+    try:
+        # Try the newer API first
+        augmenter = audiomentations.Compose([
+            audiomentations.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+            audiomentations.TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+            audiomentations.PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
+            audiomentations.Gain(min_gain_in_db=-6, max_gain_in_db=6, p=0.5),
+        ])
+    except TypeError:
+        # Fall back to older API version
+        try:
+            augmenter = audiomentations.Compose([
+                audiomentations.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+                audiomentations.TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+                audiomentations.PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
+                audiomentations.Gain(min_gain_db=-6, max_gain_db=6, p=0.5),  # Older API used min_gain_db
+            ])
+        except TypeError:
+            # Even older version or different API
+            print("Warning: Could not initialize all audio augmentations. Using minimal set.")
+            augmenter = audiomentations.Compose([
+                audiomentations.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+                audiomentations.TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+                # Skip problematic augmentations
+            ])
+    
+    return augmenter
+
+# Spectrogram augmentation with SpecAugment
+def spec_augment(spec, freq_mask_param=10, time_mask_param=20, num_masks=2):
+    """
+    Apply SpecAugment to a spectrogram (frequency and time masking)
+    """
+    spec = spec.copy()
+    
+    # Apply frequency masking
+    for i in range(num_masks):
+        f = np.random.randint(0, freq_mask_param)
+        f0 = np.random.randint(0, spec.shape[0] - f)
+        spec[f0:f0 + f, :] = np.min(spec)
+    
+    # Apply time masking
+    for i in range(num_masks):
+        t = np.random.randint(0, time_mask_param)
+        t0 = np.random.randint(0, spec.shape[1] - t)
+        spec[:, t0:t0 + t] = np.min(spec)
+    
+    return spec
+
+# Function to process all audio files and create a dataset
+def process_dataset(parkinsons_dir, control_dir, output_dir='processed_data'):
+    """
+    Process all audio files and organize into train/val/test sets
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'spectrograms'), exist_ok=True)
+    
+    data = []
+    
+    # Process Parkinson's files
+    print("Processing Parkinson's audio files...")
+    for filename in tqdm(os.listdir(parkinsons_dir)):
+        if filename.endswith('.wav'):
+            file_path = os.path.join(parkinsons_dir, filename)
+            audio = load_and_preprocess_audio(file_path)
+            
+            if audio is not None:
+                mel_spec = create_mel_spectrogram(audio)
+                resized_spec = resize_for_cnn(mel_spec)
+                
+                # Save spectrogram
+                output_path = os.path.join(output_dir, 'spectrograms', f'pd_{filename[:-4]}.png')
+                cv2.imwrite(output_path, cv2.cvtColor(resized_spec, cv2.COLOR_RGB2BGR))  # Convert back to BGR for OpenCV
+                
+                data.append({
+                    'filename': filename,
+                    'spectrogram_path': output_path,
+                    'label': 1,  # 1 for Parkinson's
+                    'original_path': file_path
+                })
+    
+    # Process Control files
+    print("Processing Control audio files...")
+    for filename in tqdm(os.listdir(control_dir)):
+        if filename.endswith('.wav'):
+            file_path = os.path.join(control_dir, filename)
+            audio = load_and_preprocess_audio(file_path)
+            
+            if audio is not None:
+                mel_spec = create_mel_spectrogram(audio)
+                resized_spec = resize_for_cnn(mel_spec)
+                
+                # Save spectrogram
+                output_path = os.path.join(output_dir, 'spectrograms', f'control_{filename[:-4]}.png')
+                cv2.imwrite(output_path, cv2.cvtColor(resized_spec, cv2.COLOR_RGB2BGR))  # Convert back to BGR for OpenCV
+                
+                data.append({
+                    'filename': filename,
+                    'spectrogram_path': output_path,
+                    'label': 0,  # 0 for Control
+                    'original_path': file_path
+                })
+    
+    # Create DataFrame
+    df = pd.DataFrame(data)
+    
+    # Split into train, validation, and test sets (70/15/15 stratified split)
+    train_df, temp_df = train_test_split(
+        df, test_size=0.3, random_state=SEED, stratify=df['label']
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=0.5, random_state=SEED, stratify=temp_df['label']
+    )
+    
+    # Save splits to CSV
+    train_df.to_csv(os.path.join(output_dir, 'train.csv'), index=False)
+    val_df.to_csv(os.path.join(output_dir, 'val.csv'), index=False)
+    test_df.to_csv(os.path.join(output_dir, 'test.csv'), index=False)
+    
+    print(f"Train set: {len(train_df)} files")
+    print(f"Validation set: {len(val_df)} files")
+    print(f"Test set: {len(test_df)} files")
+    
+    return train_df, val_df, test_df
+
+# PyTorch Dataset class for spectrograms
+class SpectrogramDataset(Dataset):
+    def __init__(self, dataframe, transform=None, augment=False):
+        self.dataframe = dataframe
+        self.transform = transform
+        self.augment = augment
+        self.audio_augmenter = get_audio_augmenter() if augment else None
+    
+    def __len__(self):
+        return len(self.dataframe)
+    
+    def __getitem__(self, idx):
+        row = self.dataframe.iloc[idx]
+        
+        # Two options: load saved spectrogram or generate on-the-fly
+        # Option 1: Load saved spectrogram (faster)
+        if os.path.exists(row['spectrogram_path']):
+            # Load spectrogram image
+            img = cv2.imread(row['spectrogram_path'])
+            # Convert BGR to RGB
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Apply spectrogram augmentation (SpecAugment)
+            if self.augment and random.random() > 0.5:
+                # Convert to grayscale for spec augment
+                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                gray = spec_augment(gray)
+                # Convert back to color
+                img = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Apply transforms if specified
+            if self.transform:
+                img = self.transform(img)
+        
+        # Option 2: Generate spectrogram on-the-fly (allows audio augmentation)
+        else:
+            # Load audio
+            audio = load_and_preprocess_audio(row['original_path'])
+            
+            # Apply audio augmentation
+            if self.augment and random.random() > 0.5:
+                audio = self.audio_augmenter(samples=audio, sample_rate=SAMPLE_RATE)
+            
+            # Generate spectrogram
+            mel_spec = create_mel_spectrogram(audio)
+            
+            # Apply spectrogram augmentation
+            if self.augment and random.random() > 0.5:
+                mel_spec = spec_augment(mel_spec)
+            
+            # Resize for CNN
+            img = resize_for_cnn(mel_spec)
+            
+            # Apply transforms if specified
+            if self.transform:
+                img = self.transform(img)
+        
+        # Get label
+        label = row['label']
+        
+        return img, label
+
+# Example: how to run the dataset processing
+def main():
+    # Example file paths - update these to your actual directories
+    parkinsons_dir = "/kaggle/input/pd-voice-samples/PD_AH"
+    control_dir = "/kaggle/input/pd-voice-samples/HC_AH"
+    
+    # Process dataset and create train/val/test splits
+    train_df, val_df, test_df = process_dataset(parkinsons_dir, control_dir)
+    
+    # Process a few examples to verify
+    if len(train_df) > 0:
+        # Example from PD class
+        example_pd = train_df[train_df['label'] == 1].iloc[0]
+        
+        # Example from Control class
+        example_control = train_df[train_df['label'] == 0].iloc[0]
+        
+        # Show examples with plots
+        print("\nExample Parkinson's spectrogram:")
+        process_example_file(example_pd['original_path'])
+        
+        print("\nExample Control spectrogram:")
+        process_example_file(example_control['original_path'])
+        
+        print("\nExample with augmentation:")
+        process_example_file(example_pd['original_path'], augment=True)
+
+# Process an example file with visualization
+def process_example_file(file_path, plot=True, augment=False):
+    """
+    Process an example file to demonstrate the pipeline
+    """
+    # Load and preprocess audio
+    audio = load_and_preprocess_audio(file_path)
+    
+    if audio is None:
+        return None
+    
+    # Optional audio augmentation
+    if augment:
+        augmenter = get_audio_augmenter()
+        audio = augmenter(samples=audio, sample_rate=SAMPLE_RATE)
+    
+    # Create mel spectrogram
+    mel_spec = create_mel_spectrogram(audio)
+    
+    # Optional spectrogram augmentation
+    if augment:
+        mel_spec = spec_augment(mel_spec)
+    
+    # Resize for CNN
+    resized_spec = resize_for_cnn(mel_spec)
+    
+    # Plot if requested
+    if plot:
+        plt.figure(figsize=(15, 12))
+        
+        plt.subplot(3, 1, 1)
+        librosa.display.waveshow(audio, sr=SAMPLE_RATE)
+        plt.title('Waveform')
+        
+        plt.subplot(3, 1, 2)
+        librosa.display.specshow(
+            mel_spec, 
+            sr=SAMPLE_RATE, 
+            hop_length=HOP_LENGTH,
+            x_axis='time',
+            y_axis='mel'
+        )
+        plt.colorbar(format='%+2.0f dB')
+        plt.title(f"Mel Spectrogram (Shape: {mel_spec.shape[0]}x{mel_spec.shape[1]})")
+        
+        plt.subplot(3, 1, 3)
+        plt.imshow(resized_spec)
+        plt.title(f'CNN Input (Shape: {resized_spec.shape[0]}x{resized_spec.shape[1]})')
+        plt.axis('off')  # Remove axes for cleaner image display
+        plt.tight_layout()
+        plt.show()
+        
+        # Print shape details
+        print(f"Audio duration: {len(audio)/SAMPLE_RATE:.2f} seconds")
+        print(f"Mel spectrogram shape: {mel_spec.shape}")
+        print(f"CNN input shape: {resized_spec.shape}")
+    
+    return {
+        'audio': audio,
+        'mel_spec': mel_spec,
+        'resized_spec': resized_spec
+    }
